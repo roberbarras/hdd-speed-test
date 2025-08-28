@@ -8,8 +8,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 RESULT_CSV="$SCRIPT_DIR/resultados_cp_test.csv"
 
 LOCAL_SRC_DIR="$SCRIPT_DIR/test_files_src"
-TARGET_MOUNT=${TARGET_MOUNT:-"/media/$USER/$(ls /media/$USER | head -n 1)"}
-DEST_EXT_DIR="$TARGET_MOUNT/test_files_dst"
+DEST_EXT_DIR=""   # se definirá después con la selección de disco
 
 declare -a TESTS=(
   "100 1 1MB"
@@ -19,6 +18,44 @@ declare -a TESTS=(
 )
 
 # === FUNCIONES ===
+
+select_disk() {
+  echo "🔍 Buscando discos disponibles..."
+  lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,LABEL -r | grep -E "disk|part" > /tmp/disks.txt
+
+  if [ ! -s /tmp/disks.txt ]; then
+    echo "❌ No se encontraron discos disponibles."
+    exit 1
+  fi
+
+  echo "📂 Discos detectados:"
+  nl -w2 -s". " /tmp/disks.txt
+
+  echo
+  read -rp "👉 Elige el número del disco/partición donde quieres hacer las pruebas: " choice
+
+  SELECTED=$(sed -n "${choice}p" /tmp/disks.txt)
+  DEV_NAME=$(echo "$SELECTED" | awk '{print $1}')
+  TYPE=$(echo "$SELECTED" | awk '{print $3}')
+  MOUNTPOINT=$(echo "$SELECTED" | awk '{print $4}')
+
+  if [ -z "$MOUNTPOINT" ] || [ "$MOUNTPOINT" == "-" ]; then
+    echo "⚠️ El dispositivo /dev/$DEV_NAME no está montado."
+    read -rp "¿Quieres montarlo temporalmente en /mnt/test_disk? [s/N]: " mount_choice
+    if [[ "$mount_choice" =~ ^[sS]$ ]]; then
+      sudo mkdir -p /mnt/test_disk
+      sudo mount "/dev/$DEV_NAME" /mnt/test_disk
+      MOUNTPOINT="/mnt/test_disk"
+      echo "✅ Montado en $MOUNTPOINT"
+    else
+      echo "❌ No se puede continuar sin un punto de montaje."
+      exit 1
+    fi
+  fi
+
+  DEST_EXT_DIR="$MOUNTPOINT/test_files_dst"
+  echo "📂 Punto de prueba seleccionado: $DEST_EXT_DIR"
+}
 
 format_speed() {
   local speed=$1
@@ -66,8 +103,13 @@ copy_to_external() {
     read -r COUNT SIZE LABEL <<< "$test"
     echo "✍ Escribiendo $LABEL..."
     START=$(date +%s.%N)
-    cp "$LOCAL_SRC_DIR"/file_${LABEL}_* "$DEST_EXT_DIR/"
-    sync
+
+    for ((i=1; i<=COUNT; i++)); do
+      dd if="$LOCAL_SRC_DIR/file_${LABEL}_${i}" \
+         of="$DEST_EXT_DIR/file_${LABEL}_${i}" \
+         bs=1M oflag=direct status=none
+    done
+
     END=$(date +%s.%N)
     TIME=$(echo "$END - $START" | bc)
     SIZE_MB=$(echo "$COUNT * $SIZE" | bc)
@@ -84,11 +126,12 @@ copy_from_external_to_null() {
     echo "📖 Leyendo $LABEL..."
     START=$(date +%s.%N)
 
-    for file in "$DEST_EXT_DIR"/file_${LABEL}_*; do
-      cp "$file" /dev/null
+    for ((i=1; i<=COUNT; i++)); do
+      dd if="$DEST_EXT_DIR/file_${LABEL}_${i}" \
+         of=/dev/null \
+         bs=1M iflag=direct status=none
     done
 
-    sync
     END=$(date +%s.%N)
     TIME=$(echo "$END - $START" | bc)
     SIZE_MB=$(echo "$COUNT * $SIZE" | bc)
@@ -122,16 +165,13 @@ write_csv() {
 # === EJECUCIÓN ===
 
 echo "🚀 Iniciando pruebas de velocidad de disco..."
-echo "📂 Disco externo detectado: $TARGET_MOUNT"
-
-if [ ! -d "$TARGET_MOUNT" ]; then
-  echo "❌ ERROR: No se encontró el punto de montaje $TARGET_MOUNT"
-  exit 1
-fi
-
-START_ALL=$(date +%s.%N)
+select_disk
 
 check_or_create_files
+
+# Ahora sí: solo medir escritura + lectura
+START_ALL=$(date +%s.%N)
+
 copy_to_external
 copy_from_external_to_null
 
@@ -140,4 +180,4 @@ TOTAL_DURATION=$(echo "$END_ALL - $START_ALL" | bc)
 
 write_csv
 
-echo "✅ Pruebas completadas. Tiempo total: $TOTAL_DURATION segundos."
+echo "✅ Pruebas completadas. Tiempo total (solo I/O): $TOTAL_DURATION segundos."
